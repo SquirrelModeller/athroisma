@@ -73,8 +73,38 @@ struct DiskDevSample {
 
 enum Vendor {
     Amd,
-    // Nvidia,
-    // Intel,
+    Nvidia,
+    Intel,
+}
+
+// NVML FFI types, layout verified against nvml.h
+const NVML_SUCCESS: u32 = 0;
+
+type FnNvmlInit = unsafe extern "C" fn() -> u32;
+type FnNvmlGetHandleByPciBusId =
+    unsafe extern "C" fn(*const libc::c_char, *mut *mut libc::c_void) -> u32;
+type FnNvmlGetUtilizationRates =
+    unsafe extern "C" fn(*mut libc::c_void, *mut NvmlUtilization) -> u32;
+type FnNvmlGetMemoryInfo = unsafe extern "C" fn(*mut libc::c_void, *mut NvmlMemory) -> u32;
+
+#[repr(C)]
+struct NvmlUtilization {
+    gpu: u32,
+    memory: u32,
+}
+
+#[repr(C)]
+struct NvmlMemory {
+    total: u64,
+    free: u64,
+    used: u64,
+}
+
+struct NvmlLib {
+    _handle: *mut libc::c_void,
+    get_handle_by_pci: FnNvmlGetHandleByPciBusId,
+    get_utilization: FnNvmlGetUtilizationRates,
+    get_memory_info: FnNvmlGetMemoryInfo,
 }
 
 // Static GPU metadata, discovered once at startup, cards (probably) don't change at runtime.
@@ -86,6 +116,7 @@ struct GpuCardMeta {
     path_vram_used: String,
     path_vram_total: String,
     hwmon_path: Option<String>,
+    nvml_device: Option<*mut libc::c_void>,
 }
 
 // What the caller wants sampled this tick
@@ -234,7 +265,7 @@ struct DiskOut {
     partitions: Vec<DiskOut>,
 }
 
-fn sample(cards: &[GpuCardMeta], req: &Request) -> Sample {
+fn sample(cards: &[GpuCardMeta], req: &Request, nvml: Option<&NvmlLib>) -> Sample {
     let at = Instant::now();
     let cpu = if req.cpu {
         read_cpu_ticks()
@@ -262,6 +293,8 @@ fn sample(cards: &[GpuCardMeta], req: &Request) -> Sample {
             .map(|meta| {
                 let (busy, temp_mc, power_mw, vram_used, vram_total) = match meta.vendor {
                     Vendor::Amd => read_card_stats_amd(meta),
+                    Vendor::Nvidia => read_card_stats_nvidia(meta, nvml),
+                    Vendor::Intel => read_card_stats_intel(meta),
                 };
                 let gpu_procs = gpu_proc_map.get(&meta.pdev).cloned().unwrap_or_default();
                 GpuSample {
@@ -359,13 +392,61 @@ fn detect_vendor(dev: &str) -> Option<Vendor> {
         .trim()
     {
         "0x1002" => Some(Vendor::Amd),
-        // "0x10de" => Some(Vendor::Nvidia),
-        // "0x8086" => Some(Vendor::Intel),
+        "0x10de" => Some(Vendor::Nvidia),
+        "0x8086" => Some(Vendor::Intel),
         _ => None,
     }
 }
 
-fn discover_gpu_cards() -> Vec<GpuCardMeta> {
+fn nvml_load() -> Option<NvmlLib> {
+    unsafe {
+        let handle = libc::dlopen(
+            b"libnvidia-ml.so.1\0".as_ptr() as *const libc::c_char,
+            libc::RTLD_LAZY,
+        );
+        if handle.is_null() {
+            return None;
+        }
+
+        let init_ptr = libc::dlsym(handle, b"nvmlInit_v2\0".as_ptr() as _);
+        let pci_ptr = libc::dlsym(handle, b"nvmlDeviceGetHandleByPciBusId_v2\0".as_ptr() as _);
+        let util_ptr = libc::dlsym(handle, b"nvmlDeviceGetUtilizationRates\0".as_ptr() as _);
+        let mem_ptr = libc::dlsym(handle, b"nvmlDeviceGetMemoryInfo\0".as_ptr() as _);
+
+        if init_ptr.is_null() || pci_ptr.is_null() || util_ptr.is_null() || mem_ptr.is_null() {
+            libc::dlclose(handle);
+            return None;
+        }
+
+        let init_fn: FnNvmlInit = std::mem::transmute(init_ptr);
+        if init_fn() != NVML_SUCCESS {
+            libc::dlclose(handle);
+            return None;
+        }
+
+        Some(NvmlLib {
+            _handle: handle,
+            get_handle_by_pci: std::mem::transmute(pci_ptr),
+            get_utilization: std::mem::transmute(util_ptr),
+            get_memory_info: std::mem::transmute(mem_ptr),
+        })
+    }
+}
+
+fn nvml_device_for_pdev(nvml: &NvmlLib, pdev: &str) -> Option<*mut libc::c_void> {
+    let Ok(pci) = std::ffi::CString::new(pdev) else {
+        return None;
+    };
+    let mut device: *mut libc::c_void = std::ptr::null_mut();
+    let ret = unsafe { (nvml.get_handle_by_pci)(pci.as_ptr(), &mut device) };
+    if ret != NVML_SUCCESS || device.is_null() {
+        None
+    } else {
+        Some(device)
+    }
+}
+
+fn discover_gpu_cards(nvml: Option<&NvmlLib>) -> Vec<GpuCardMeta> {
     let mut cards = Vec::new();
     let Ok(dir) = fs::read_dir("/sys/class/drm") else {
         return cards;
@@ -388,6 +469,11 @@ fn discover_gpu_cards() -> Vec<GpuCardMeta> {
             .and_then(|mut d| d.next())
             .and_then(|e| e.ok())
             .map(|e| e.path().to_string_lossy().into_owned());
+        let nvml_device = if matches!(vendor, Vendor::Nvidia) {
+            nvml.and_then(|n| nvml_device_for_pdev(n, &pdev))
+        } else {
+            None
+        };
         cards.push(GpuCardMeta {
             card,
             pdev,
@@ -396,6 +482,7 @@ fn discover_gpu_cards() -> Vec<GpuCardMeta> {
             path_vram_used,
             path_vram_total,
             hwmon_path,
+            nvml_device,
         });
     }
     cards.sort_by(|a, b| a.card.cmp(&b.card));
@@ -452,15 +539,7 @@ fn read_sysfs_u64(path: impl AsRef<std::path::Path>) -> u64 {
         .unwrap_or(0)
 }
 
-fn read_card_stats_amd(meta: &GpuCardMeta) -> (u8, i32, u32, u64, u64) {
-    let busy = read_sysfs_u64(&meta.path_busy) as u8;
-    let vram_used = read_sysfs_u64(&meta.path_vram_used);
-    let vram_total = read_sysfs_u64(&meta.path_vram_total);
-    let (temp_mc, power_mw) = read_gpu_hwmon_amd(meta);
-    (busy, temp_mc, power_mw, vram_used, vram_total)
-}
-
-fn read_gpu_hwmon_amd(meta: &GpuCardMeta) -> (i32, u32) {
+fn read_gpu_hwmon(meta: &GpuCardMeta) -> (i32, u32) {
     let Some(ref hwmon) = meta.hwmon_path else {
         return (0, 0);
     };
@@ -475,6 +554,45 @@ fn read_gpu_hwmon_amd(meta: &GpuCardMeta) -> (i32, u32) {
         .map(|uw| (uw / 1000) as u32)
         .unwrap_or(0);
     (temp, power_mw)
+}
+
+fn read_card_stats_amd(meta: &GpuCardMeta) -> (u8, i32, u32, u64, u64) {
+    let busy = read_sysfs_u64(&meta.path_busy) as u8;
+    let vram_used = read_sysfs_u64(&meta.path_vram_used);
+    let vram_total = read_sysfs_u64(&meta.path_vram_total);
+    let (temp_mc, power_mw) = read_gpu_hwmon(meta);
+    (busy, temp_mc, power_mw, vram_used, vram_total)
+}
+
+fn read_card_stats_nvidia(meta: &GpuCardMeta, nvml: Option<&NvmlLib>) -> (u8, i32, u32, u64, u64) {
+    let (temp_mc, power_mw) = read_gpu_hwmon(meta);
+    let (Some(nvml), Some(device)) = (nvml, meta.nvml_device) else {
+        return (0, temp_mc, power_mw, 0, 0);
+    };
+    let mut util = NvmlUtilization { gpu: 0, memory: 0 };
+    let mut mem = NvmlMemory {
+        total: 0,
+        free: 0,
+        used: 0,
+    };
+    unsafe {
+        if (nvml.get_utilization)(device, &mut util) != NVML_SUCCESS {
+            util.gpu = 0;
+        }
+        if (nvml.get_memory_info)(device, &mut mem) != NVML_SUCCESS {
+            mem.used = 0;
+            mem.total = 0;
+        }
+    }
+    (util.gpu as u8, temp_mc, power_mw, mem.used, mem.total)
+}
+
+fn read_card_stats_intel(meta: &GpuCardMeta) -> (u8, i32, u32, u64, u64) {
+    // busy% not available via sysfs; VRAM paths exist for xe discrete GPUs, zero for iGPU
+    let vram_used = read_sysfs_u64(&meta.path_vram_used);
+    let vram_total = read_sysfs_u64(&meta.path_vram_total);
+    let (temp_mc, power_mw) = read_gpu_hwmon(meta);
+    (0, temp_mc, power_mw, vram_used, vram_total)
 }
 
 fn read_pdev(dev: &str) -> String {
@@ -538,7 +656,18 @@ fn read_proc_stat(pid: u32, path: &mut String) -> Option<(u64, u64)> {
 fn parse_fdinfo(vendor: &Vendor, content: &str) -> Option<(u64, u64)> {
     match vendor {
         Vendor::Amd => parse_fdinfo_amd(content),
+        Vendor::Nvidia => parse_fdinfo_nvidia(content),
+        Vendor::Intel => parse_fdinfo_intel(content),
     }
+}
+
+fn fdinfo_u64(content: &str, key: &str) -> u64 {
+    content
+        .lines()
+        .find(|l| l.starts_with(key))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 fn parse_fdinfo_amd(content: &str) -> Option<(u64, u64)> {
@@ -548,19 +677,44 @@ fn parse_fdinfo_amd(content: &str) -> Option<(u64, u64)> {
     {
         return None;
     }
-    let vram: u64 = content
+    Some((
+        fdinfo_u64(content, "drm-memory-vram:"),
+        fdinfo_u64(content, "drm-engine-gfx:"),
+    ))
+}
+
+fn parse_fdinfo_nvidia(content: &str) -> Option<(u64, u64)> {
+    if !content
         .lines()
-        .find(|l| l.starts_with("drm-memory-vram:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let ns: u64 = content
+        .any(|l| l.starts_with("drm-driver:") && l.contains("nvidia"))
+    {
+        return None;
+    }
+    let vram = fdinfo_u64(content, "drm-memory-device:");
+    // prefer graphics engine time, fall back to compute
+    let ns = content
         .lines()
-        .find(|l| l.starts_with("drm-engine-gfx:"))
+        .find(|l| l.starts_with("drm-engine-graphics:") || l.starts_with("drm-engine-compute:"))
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     Some((vram, ns))
+}
+
+fn parse_fdinfo_intel(content: &str) -> Option<(u64, u64)> {
+    if !content
+        .lines()
+        .any(|l| l.starts_with("drm-driver:") && (l.contains("i915") || l.contains("xe")))
+    {
+        return None;
+    }
+    // prefer device memory (Arc dGPU), fall back to system memory (iGPU)
+    let vram = if fdinfo_u64(content, "drm-memory-device:") > 0 {
+        fdinfo_u64(content, "drm-memory-device:")
+    } else {
+        fdinfo_u64(content, "drm-memory-system:")
+    };
+    Some((vram, fdinfo_u64(content, "drm-engine-render:")))
 }
 
 // Walk /proc once, collecting process stats and per-GPU fdinfo simultaneously.
@@ -994,13 +1148,14 @@ fn main() {
         }
     });
 
-    let cards = discover_gpu_cards();
+    let nvml = nvml_load();
+    let cards = discover_gpu_cards(nvml.as_ref());
     let mut req = if initial_req.is_empty() {
         Request::default()
     } else {
         Request::parse(&initial_req)
     };
-    let mut prev = sample(&cards, &req);
+    let mut prev = sample(&cards, &req, nvml.as_ref());
     thread::sleep(Duration::from_millis(interval_ms));
 
     loop {
@@ -1016,7 +1171,7 @@ fn main() {
         }
 
         let tick_start = Instant::now();
-        let curr = sample(&cards, &req);
+        let curr = sample(&cards, &req, nvml.as_ref());
         println!(
             "{}",
             serde_json::to_string(&diff(&prev, &curr, &req)).unwrap()
