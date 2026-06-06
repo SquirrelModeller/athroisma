@@ -3,6 +3,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::BufRead;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -320,6 +321,12 @@ fn read_mem() -> MemSample {
     }
 }
 
+fn page_size() -> u64 {
+    static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+    // sysconf(_SC_PAGESIZE) has no preconditions and never fails
+    *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 })
+}
+
 fn parse_kb(s: &str) -> u64 {
     s.split_whitespace()
         .next()
@@ -507,7 +514,7 @@ fn read_proc_stat(pid: u32, path: &mut String) -> Option<(u64, u64)> {
     let utime: u64 = iter.nth(11)?.parse().ok()?;
     let stime: u64 = iter.next()?.parse().ok()?;
     let rss_pages: u64 = iter.nth(8)?.parse().ok()?;
-    Some((utime + stime, rss_pages * 4096))
+    Some((utime + stime, rss_pages * page_size()))
 }
 
 fn parse_fdinfo(vendor: &Vendor, content: &str) -> Option<(u64, u64)> {
