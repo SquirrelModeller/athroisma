@@ -656,7 +656,7 @@ fn diff_cpu_procs(
         .filter_map(|p| {
             let dt = p
                 .cpu_ticks
-                .saturating_sub(*prev_ticks.get(&p.pid).unwrap_or(&0));
+                .saturating_sub(*prev_ticks.get(&p.pid).unwrap_or(&p.cpu_ticks));
             if dt == 0 || total_d == 0 {
                 return None;
             }
@@ -705,7 +705,7 @@ fn diff_gpu_procs(g: &GpuSample, prev_ns: &HashMap<u32, u64>, elapsed_ns: u64) -
         .map(|p| {
             let ns_d = p
                 .engine_gfx_ns
-                .saturating_sub(*prev_ns.get(&p.pid).unwrap_or(&0));
+                .saturating_sub(*prev_ns.get(&p.pid).unwrap_or(&p.engine_gfx_ns));
             GpuProcOut {
                 name: String::new(),
                 pid: p.pid,
@@ -825,15 +825,18 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
         let mut ifaces: Vec<IfaceOut> = curr
             .net
             .iter()
-            .filter_map(|i| {
-                let p = prev_net.get(i.name.as_str())?;
-                let rx_d = i.rx_bytes.saturating_sub(p.rx_bytes);
-                let tx_d = i.tx_bytes.saturating_sub(p.tx_bytes);
-                Some(IfaceOut {
+            .map(|i| {
+                let (rx_d, tx_d) = prev_net.get(i.name.as_str()).map_or((0, 0), |p| {
+                    (
+                        i.rx_bytes.saturating_sub(p.rx_bytes),
+                        i.tx_bytes.saturating_sub(p.tx_bytes),
+                    )
+                });
+                IfaceOut {
                     name: i.name.clone(),
                     rx_bytes_per_sec: bytes_per_sec(rx_d, elapsed_ns),
                     tx_bytes_per_sec: bytes_per_sec(tx_d, elapsed_ns),
-                })
+                }
             })
             .collect();
         ifaces.sort_by(|a, b| a.name.cmp(&b.name));
@@ -850,11 +853,14 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
         let mut dev_map: HashMap<String, DiskOut> = curr
             .disk
             .iter()
-            .filter_map(|d| {
-                let p = prev_disk.get(d.name.as_str())?;
-                let rd = d.read_bytes.saturating_sub(p.read_bytes);
-                let wd = d.write_bytes.saturating_sub(p.write_bytes);
-                Some((
+            .map(|d| {
+                let (rd, wd) = prev_disk.get(d.name.as_str()).map_or((0, 0), |p| {
+                    (
+                        d.read_bytes.saturating_sub(p.read_bytes),
+                        d.write_bytes.saturating_sub(p.write_bytes),
+                    )
+                });
+                (
                     d.name.clone(),
                     DiskOut {
                         name: d.name.clone(),
@@ -862,7 +868,7 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
                         write_bytes_per_sec: bytes_per_sec(wd, elapsed_ns),
                         partitions: Vec::new(),
                     },
-                ))
+                )
             })
             .collect();
 
