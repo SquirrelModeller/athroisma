@@ -1130,12 +1130,11 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut interval_ms: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(1000);
-    let initial_req = if args.len() > 1 {
-        args[1..].join(" ")
-    } else {
-        String::new()
+    let (mut interval_ms, req_args) = match args.first().and_then(|s| s.parse::<u64>().ok()) {
+        Some(ms) => (ms, &args[1..]),
+        None => (1000, &args[..]),
     };
+    let initial_req = req_args.join(" ");
 
     // Background thread feeds stdin lines into a channel.
     let (tx, rx) = mpsc::channel::<String>();
