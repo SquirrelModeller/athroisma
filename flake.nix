@@ -16,6 +16,11 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [pkgs.makeWrapper];
+        postInstall = ''
+          wrapProgram $out/bin/athroisma \
+            --prefix LD_LIBRARY_PATH : /run/opengl-driver/lib
+        '';
       };
     });
 
