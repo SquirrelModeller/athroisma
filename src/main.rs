@@ -96,6 +96,10 @@ struct Request {
     net: bool,
     disk: bool,
     procs: bool,
+    // true = exclude procs with 0 cpu/mem/vram usage
+    filter_zero: bool,
+    // None = unlimited
+    proc_limit: Option<usize>,
 }
 
 impl Default for Request {
@@ -107,6 +111,8 @@ impl Default for Request {
             net: true,
             disk: true,
             procs: true,
+            filter_zero: false,
+            proc_limit: None,
         }
     }
 }
@@ -120,8 +126,11 @@ impl Request {
             net: false,
             disk: false,
             procs: false,
+            filter_zero: false,
+            proc_limit: None,
         };
-        for token in line.split_whitespace() {
+        let mut tokens = line.split_whitespace().peekable();
+        while let Some(token) = tokens.next() {
             match token {
                 "cpu" => r.cpu = true,
                 "mem" => r.mem = true,
@@ -129,6 +138,15 @@ impl Request {
                 "net" => r.net = true,
                 "disk" => r.disk = true,
                 "procs" => r.procs = true,
+                "nozero" => r.filter_zero = true,
+                "limit" => {
+                    if let Some(&next) = tokens.peek() {
+                        if let Ok(n) = next.parse::<usize>() {
+                            tokens.next();
+                            r.proc_limit = if n == 0 { None } else { Some(n) };
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -650,6 +668,8 @@ fn diff_cpu_procs(
     curr: &[ProcSample],
     prev_ticks: &HashMap<u32, u64>,
     total_d: u64,
+    filter_zero: bool,
+    proc_limit: Option<usize>,
 ) -> Vec<ProcCpuOut> {
     let mut procs: Vec<ProcCpuOut> = curr
         .iter()
@@ -657,13 +677,17 @@ fn diff_cpu_procs(
             let dt = p
                 .cpu_ticks
                 .saturating_sub(*prev_ticks.get(&p.pid).unwrap_or(&p.cpu_ticks));
-            if dt == 0 || total_d == 0 {
+            if filter_zero && dt == 0 {
                 return None;
             }
             Some(ProcCpuOut {
                 name: String::new(),
                 pid: p.pid,
-                cpu: dt as f32 / total_d as f32 * 100.0,
+                cpu: if total_d > 0 {
+                    dt as f32 / total_d as f32 * 100.0
+                } else {
+                    0.0
+                },
             })
         })
         .collect();
@@ -672,17 +696,23 @@ fn diff_cpu_procs(
             .partial_cmp(&a.cpu)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    procs.truncate(10);
+    if let Some(limit) = proc_limit {
+        procs.truncate(limit);
+    }
     for p in &mut procs {
         p.name = resolve_name(p.pid);
     }
     procs
 }
 
-fn diff_mem_procs(curr: &[ProcSample]) -> Vec<ProcMemOut> {
+fn diff_mem_procs(
+    curr: &[ProcSample],
+    filter_zero: bool,
+    proc_limit: Option<usize>,
+) -> Vec<ProcMemOut> {
     let mut procs: Vec<ProcMemOut> = curr
         .iter()
-        .filter(|p| p.rss_bytes > 0)
+        .filter(|p| !filter_zero || p.rss_bytes > 0)
         .map(|p| ProcMemOut {
             name: String::new(),
             pid: p.pid,
@@ -690,18 +720,26 @@ fn diff_mem_procs(curr: &[ProcSample]) -> Vec<ProcMemOut> {
         })
         .collect();
     procs.sort_by(|a, b| b.rss.cmp(&a.rss));
-    procs.truncate(10);
+    if let Some(limit) = proc_limit {
+        procs.truncate(limit);
+    }
     for p in &mut procs {
         p.name = resolve_name(p.pid);
     }
     procs
 }
 
-fn diff_gpu_procs(g: &GpuSample, prev_ns: &HashMap<u32, u64>, elapsed_ns: u64) -> Vec<GpuProcOut> {
+fn diff_gpu_procs(
+    g: &GpuSample,
+    prev_ns: &HashMap<u32, u64>,
+    elapsed_ns: u64,
+    filter_zero: bool,
+    proc_limit: Option<usize>,
+) -> Vec<GpuProcOut> {
     let mut procs: Vec<GpuProcOut> = g
         .procs
         .iter()
-        .filter(|p| p.vram_kib > 0)
+        .filter(|p| !filter_zero || p.vram_kib > 0)
         .map(|p| {
             let ns_d = p
                 .engine_gfx_ns
@@ -719,7 +757,9 @@ fn diff_gpu_procs(g: &GpuSample, prev_ns: &HashMap<u32, u64>, elapsed_ns: u64) -
         })
         .collect();
     procs.sort_by(|a, b| b.vram_kib.cmp(&a.vram_kib));
-    procs.truncate(10);
+    if let Some(limit) = proc_limit {
+        procs.truncate(limit);
+    }
     for p in &mut procs {
         p.name = resolve_name(p.pid);
     }
@@ -731,6 +771,8 @@ fn diff_gpu_card(
     prev_gpus: &[GpuSample],
     elapsed_ns: u64,
     include_procs: bool,
+    filter_zero: bool,
+    proc_limit: Option<usize>,
 ) -> GpuOut {
     let prev_ns: HashMap<u32, u64> = prev_gpus
         .iter()
@@ -739,7 +781,7 @@ fn diff_gpu_card(
         .unwrap_or_default();
 
     let gprocs = if include_procs {
-        diff_gpu_procs(g, &prev_ns, elapsed_ns)
+        diff_gpu_procs(g, &prev_ns, elapsed_ns, filter_zero, proc_limit)
     } else {
         Vec::new()
     };
@@ -770,7 +812,13 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
         let cpu_procs = if req.procs {
             let prev_ticks: HashMap<u32, u64> =
                 prev.procs.iter().map(|p| (p.pid, p.cpu_ticks)).collect();
-            diff_cpu_procs(&curr.procs, &prev_ticks, total_d)
+            diff_cpu_procs(
+                &curr.procs,
+                &prev_ticks,
+                total_d,
+                req.filter_zero,
+                req.proc_limit,
+            )
         } else {
             Vec::new()
         };
@@ -786,7 +834,7 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
 
     let memory = if req.mem {
         let mem_procs = if req.procs {
-            diff_mem_procs(&curr.procs)
+            diff_mem_procs(&curr.procs, req.filter_zero, req.proc_limit)
         } else {
             Vec::new()
         };
@@ -812,7 +860,16 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
         let gpu_out: Vec<GpuOut> = curr
             .gpus
             .iter()
-            .map(|g| diff_gpu_card(g, &prev.gpus, elapsed_ns, req.procs))
+            .map(|g| {
+                diff_gpu_card(
+                    g,
+                    &prev.gpus,
+                    elapsed_ns,
+                    req.procs,
+                    req.filter_zero,
+                    req.proc_limit,
+                )
+            })
             .collect();
         Some(gpu_out)
     } else {
@@ -918,10 +975,13 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
 }
 
 fn main() {
-    let mut interval_ms: u64 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut interval_ms: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let initial_req = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        String::new()
+    };
 
     // Background thread feeds stdin lines into a channel.
     let (tx, rx) = mpsc::channel::<String>();
@@ -935,7 +995,11 @@ fn main() {
     });
 
     let cards = discover_gpu_cards();
-    let mut req = Request::default();
+    let mut req = if initial_req.is_empty() {
+        Request::default()
+    } else {
+        Request::parse(&initial_req)
+    };
     let mut prev = sample(&cards, &req);
     thread::sleep(Duration::from_millis(interval_ms));
 
