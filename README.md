@@ -133,6 +133,22 @@ Disk devices are structured as a tree, partitions are nested under their parent 
 
 **Processes** - all processes by CPU%, RSS, and GPU VRAM. Sorted descending within each section. Only sampled when `procs` is requested. Use `nozero` to exclude idle processes and `limit N` to cap the list length.
 
+## Performance
+
+`athroisma bench [N]` runs N iterations (default 20) and reports per-subsystem timing. Numbers below are from 200 iterations at ~4.4 GHz boost on an AMD Ryzen 7 7800X3D cpu.
+
+| Subsystem | min µs | mean µs | p95 µs | max µs |
+|---|---:|---:|---:|---:|
+| `cpu` (`/proc/stat` + `/proc/loadavg`) | 35 | 37 | 42 | 47 |
+| `mem` (`/proc/meminfo`) | 11 | 12 | 14 | 17 |
+| `proc_walk` (all of `/proc` + fdinfo) | 14,693 | 15,244 | 16,952 | 20,625 |
+| `gpu` (sysfs + hwmon per card) | 209 | 868 | 1,352 | 1,728 |
+| `net` (`/proc/net/dev`) | 57 | 61 | 65 | 82 |
+| `disk` (`/proc/diskstats`) | 22 | 22 | 26 | 28 |
+| **total sample** | **15,027** | **16,244** | **18,451** | **22,527** |
+
+The `/proc` walk dominates at ~94% of total time. Omitting `procs` from the request skips it entirely, dropping total sample time to the low hundreds of microseconds.
+
 ## Building
 
 ```

@@ -1128,8 +1128,118 @@ fn diff(prev: &Sample, curr: &Sample, req: &Request) -> Output {
     }
 }
 
+#[derive(Serialize)]
+struct BenchStat {
+    min_us: u64,
+    max_us: u64,
+    mean_us: u64,
+    p95_us: u64,
+}
+
+#[derive(Serialize)]
+struct BenchOutput {
+    iterations: usize,
+    cpu_us: BenchStat,
+    mem_us: BenchStat,
+    proc_walk_us: BenchStat,
+    gpu_us: BenchStat,
+    net_us: BenchStat,
+    disk_us: BenchStat,
+    total_us: BenchStat,
+}
+
+fn bench_stat(mut samples: Vec<u64>) -> BenchStat {
+    samples.sort_unstable();
+    let n = samples.len();
+    let min_us = samples[0];
+    let max_us = samples[n - 1];
+    let mean_us = samples.iter().sum::<u64>() / n as u64;
+    let p95_us = samples[((n as f64 * 0.95) as usize).min(n - 1)];
+    BenchStat {
+        min_us,
+        max_us,
+        mean_us,
+        p95_us,
+    }
+}
+
+fn run_bench(cards: &[GpuCardMeta], nvml: Option<&NvmlLib>, n: usize) {
+    // We will warmup to warm up filesystem caches
+    let req = Request::default();
+    for _ in 0..5 {
+        let _ = sample(cards, &req, nvml);
+    }
+
+    let mut cpu_us = Vec::with_capacity(n);
+    let mut mem_us = Vec::with_capacity(n);
+    let mut proc_walk_us = Vec::with_capacity(n);
+    let mut gpu_us = Vec::with_capacity(n);
+    let mut net_us = Vec::with_capacity(n);
+    let mut disk_us = Vec::with_capacity(n);
+    let mut total_us = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let t_total = Instant::now();
+
+        let t = Instant::now();
+        let _ = read_cpu_ticks();
+        let _ = read_load();
+        cpu_us.push(t.elapsed().as_micros() as u64);
+
+        let t = Instant::now();
+        let _ = read_mem();
+        mem_us.push(t.elapsed().as_micros() as u64);
+
+        // walk_proc handles both process stats and GPU fdinfo in one pass
+        let t = Instant::now();
+        let _ = walk_proc(cards);
+        proc_walk_us.push(t.elapsed().as_micros() as u64);
+
+        let t = Instant::now();
+        for card in cards {
+            let _ = match card.vendor {
+                Vendor::Amd => read_card_stats_amd(card),
+                Vendor::Nvidia => read_card_stats_nvidia(card, nvml),
+                Vendor::Intel => read_card_stats_intel(card),
+            };
+        }
+        gpu_us.push(t.elapsed().as_micros() as u64);
+
+        let t = Instant::now();
+        let _ = read_net();
+        net_us.push(t.elapsed().as_micros() as u64);
+
+        let t = Instant::now();
+        let _ = read_disk();
+        disk_us.push(t.elapsed().as_micros() as u64);
+
+        total_us.push(t_total.elapsed().as_micros() as u64);
+    }
+
+    let output = BenchOutput {
+        iterations: n,
+        cpu_us: bench_stat(cpu_us),
+        mem_us: bench_stat(mem_us),
+        proc_walk_us: bench_stat(proc_walk_us),
+        gpu_us: bench_stat(gpu_us),
+        net_us: bench_stat(net_us),
+        disk_us: bench_stat(disk_us),
+        total_us: bench_stat(total_us),
+    };
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("bench") {
+        let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+        let nvml = nvml_load();
+        let cards = discover_gpu_cards(nvml.as_ref());
+        run_bench(&cards, nvml.as_ref(), n);
+        return;
+    }
+
     let (mut interval_ms, req_args) = match args.first().and_then(|s| s.parse::<u64>().ok()) {
         Some(ms) => (ms, &args[1..]),
         None => (1000, &args[..]),
