@@ -88,6 +88,10 @@ type FnNvmlGetUtilizationRates =
 type FnNvmlGetMemoryInfo = unsafe extern "C" fn(*mut libc::c_void, *mut NvmlMemory) -> u32;
 type FnNvmlGetTemperature = unsafe extern "C" fn(*mut libc::c_void, u32, *mut u32) -> u32;
 type FnNvmlGetPowerUsage = unsafe extern "C" fn(*mut libc::c_void, *mut u32) -> u32;
+type FnNvmlGetRunningProcesses =
+    unsafe extern "C" fn(*mut libc::c_void, *mut u32, *mut NvmlProcessInfo) -> u32;
+type FnNvmlGetRunningProcessesV1 =
+    unsafe extern "C" fn(*mut libc::c_void, *mut u32, *mut NvmlProcessInfoV1) -> u32;
 
 #[repr(C)]
 struct NvmlUtilization {
@@ -102,6 +106,24 @@ struct NvmlMemory {
     used: u64,
 }
 
+// Layout matches nvmlProcessInfo_v2_t == nvmlProcessInfo_t (MIG era, used by _v3 functions)
+#[repr(C)]
+#[derive(Default, Clone)]
+struct NvmlProcessInfo {
+    pid: u32,
+    used_gpu_memory: u64, // repr(C) adds 4 bytes padding before this
+    gpu_instance_id: u32,
+    compute_instance_id: u32,
+}
+
+// Layout matches nvmlProcessInfo_v1_t (pre-CUDA 11.0 / driver < 450, no MIG fields)
+#[repr(C)]
+#[derive(Default, Clone)]
+struct NvmlProcessInfoV1 {
+    pid: u32,
+    used_gpu_memory: u64, // repr(C) adds 4 bytes padding before this
+}
+
 struct NvmlLib {
     _handle: *mut libc::c_void,
     get_handle_by_pci: FnNvmlGetHandleByPciBusId,
@@ -109,6 +131,12 @@ struct NvmlLib {
     get_memory_info: FnNvmlGetMemoryInfo,
     get_temperature: Option<FnNvmlGetTemperature>,
     get_power_usage: Option<FnNvmlGetPowerUsage>,
+    get_graphics_procs_v3: Option<FnNvmlGetRunningProcesses>,
+    get_compute_procs_v3: Option<FnNvmlGetRunningProcesses>,
+    get_graphics_procs_v2: Option<FnNvmlGetRunningProcesses>,
+    get_compute_procs_v2: Option<FnNvmlGetRunningProcesses>,
+    get_graphics_procs_v1: Option<FnNvmlGetRunningProcessesV1>,
+    get_compute_procs_v1: Option<FnNvmlGetRunningProcessesV1>,
 }
 
 // Static GPU metadata, discovered once at startup, cards (probably) don't change at runtime.
@@ -285,11 +313,22 @@ fn sample(cards: &[GpuCardMeta], req: &Request, nvml: Option<&NvmlLib>) -> Sampl
 
     // Pass empty card slice when GPU procs aren't needed so walk_proc skips fdinfo.
     let walk_cards: &[GpuCardMeta] = if req.gpu { cards } else { &[] };
-    let (procs, gpu_proc_map) = if req.procs {
+    let (procs, mut gpu_proc_map) = if req.procs {
         walk_proc(walk_cards)
     } else {
         (Vec::new(), HashMap::new())
     };
+
+    // Nvidia's proprietary driver exposes no drm-* fdinfo, use NVML instead.
+    if req.procs && req.gpu {
+        if let Some(nvml) = nvml {
+            for card in cards.iter().filter(|c| matches!(c.vendor, Vendor::Nvidia)) {
+                if let Some(device) = card.nvml_device {
+                    gpu_proc_map.insert(card.pdev.clone(), nvml_get_procs(nvml, device));
+                }
+            }
+        }
+    }
 
     let gpus = if req.gpu {
         cards
@@ -412,39 +451,54 @@ fn nvml_load() -> Option<NvmlLib> {
             return None;
         }
 
-        let init_ptr = libc::dlsym(handle, b"nvmlInit_v2\0".as_ptr() as _);
-        let pci_ptr = libc::dlsym(handle, b"nvmlDeviceGetHandleByPciBusId_v2\0".as_ptr() as _);
-        let util_ptr = libc::dlsym(handle, b"nvmlDeviceGetUtilizationRates\0".as_ptr() as _);
-        let mem_ptr = libc::dlsym(handle, b"nvmlDeviceGetMemoryInfo\0".as_ptr() as _);
-        let temp_ptr = libc::dlsym(handle, b"nvmlDeviceGetTemperature\0".as_ptr() as _);
-        let power_ptr = libc::dlsym(handle, b"nvmlDeviceGetPowerUsage\0".as_ptr() as _);
+        macro_rules! sym {
+            ($name:literal) => {
+                libc::dlsym(handle, concat!($name, "\0").as_ptr() as _)
+            };
+        }
+        // Transmutes a non-null dlsym pointer to the inferred function pointer type.
+        macro_rules! opt_fn {
+            ($ptr:expr) => {
+                if $ptr.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute($ptr))
+                }
+            };
+        }
 
+        // Required symbols — bail if any are missing.
+        let init_ptr = sym!("nvmlInit_v2");
+        let pci_ptr = sym!("nvmlDeviceGetHandleByPciBusId_v2");
+        let util_ptr = sym!("nvmlDeviceGetUtilizationRates");
+        let mem_ptr = sym!("nvmlDeviceGetMemoryInfo");
         if init_ptr.is_null() || pci_ptr.is_null() || util_ptr.is_null() || mem_ptr.is_null() {
             libc::dlclose(handle);
             return None;
         }
-
         let init_fn: FnNvmlInit = std::mem::transmute(init_ptr);
         if init_fn() != NVML_SUCCESS {
             libc::dlclose(handle);
             return None;
         }
 
+        // Optional symbols, absent on older drivers, degrade gracefully.
+        // _v3 and _v2 use nvmlProcessInfo_v2_t (24 bytes, MIG fields included).
+        // Unversioned uses nvmlProcessInfo_v1_t (16 bytes, no MIG fields, driver < 450).
+        // dlsym bypasses the C header #define aliasing, so versioned names are explicit.
         Some(NvmlLib {
             _handle: handle,
             get_handle_by_pci: std::mem::transmute(pci_ptr),
             get_utilization: std::mem::transmute(util_ptr),
             get_memory_info: std::mem::transmute(mem_ptr),
-            get_temperature: if temp_ptr.is_null() {
-                None
-            } else {
-                Some(std::mem::transmute(temp_ptr))
-            },
-            get_power_usage: if power_ptr.is_null() {
-                None
-            } else {
-                Some(std::mem::transmute(power_ptr))
-            },
+            get_temperature: opt_fn!(sym!("nvmlDeviceGetTemperature")),
+            get_power_usage: opt_fn!(sym!("nvmlDeviceGetPowerUsage")),
+            get_graphics_procs_v3: opt_fn!(sym!("nvmlDeviceGetGraphicsRunningProcesses_v3")),
+            get_compute_procs_v3: opt_fn!(sym!("nvmlDeviceGetComputeRunningProcesses_v3")),
+            get_graphics_procs_v2: opt_fn!(sym!("nvmlDeviceGetGraphicsRunningProcesses_v2")),
+            get_compute_procs_v2: opt_fn!(sym!("nvmlDeviceGetComputeRunningProcesses_v2")),
+            get_graphics_procs_v1: opt_fn!(sym!("nvmlDeviceGetGraphicsRunningProcesses")),
+            get_compute_procs_v1: opt_fn!(sym!("nvmlDeviceGetComputeRunningProcesses")),
         })
     }
 }
@@ -460,6 +514,68 @@ fn nvml_device_for_pdev(nvml: &NvmlLib, pdev: &str) -> Option<*mut libc::c_void>
     } else {
         Some(device)
     }
+}
+
+fn nvml_merge_proc(result: &mut Vec<GpuProcSample>, pid: u32, used_gpu_memory: u64) {
+    let vram_kib = if used_gpu_memory == u64::MAX {
+        0
+    } else {
+        used_gpu_memory / 1024
+    };
+    if let Some(existing) = result.iter_mut().find(|p| p.pid == pid) {
+        existing.vram_kib = existing.vram_kib.max(vram_kib);
+    } else {
+        result.push(GpuProcSample {
+            pid,
+            vram_kib,
+            engine_gfx_ns: 0,
+        });
+    }
+}
+
+fn nvml_get_procs(nvml: &NvmlLib, device: *mut libc::c_void) -> Vec<GpuProcSample> {
+    const CAP: u32 = 256;
+    let mut result: Vec<GpuProcSample> = Vec::new();
+
+    // Try v3 then v2 (both use nvmlProcessInfo_v2_t, 24 bytes; v3 is preferred per the header #define).
+    let has_v3 = nvml.get_graphics_procs_v3.is_some() || nvml.get_compute_procs_v3.is_some();
+    let has_v2 = nvml.get_graphics_procs_v2.is_some() || nvml.get_compute_procs_v2.is_some();
+    if has_v3 || has_v2 {
+        let mut infos = vec![NvmlProcessInfo::default(); CAP as usize];
+        let fns = if has_v3 {
+            [nvml.get_graphics_procs_v3, nvml.get_compute_procs_v3]
+        } else {
+            [nvml.get_graphics_procs_v2, nvml.get_compute_procs_v2]
+        };
+        for get_fn in fns.into_iter().flatten() {
+            let mut count = CAP;
+            let ret = unsafe { get_fn(device, &mut count, infos.as_mut_ptr()) };
+            if ret != NVML_SUCCESS {
+                continue;
+            }
+            for info in &infos[..count as usize] {
+                nvml_merge_proc(&mut result, info.pid, info.used_gpu_memory);
+            }
+        }
+        return result;
+    }
+
+    // Fall back to unversioned v1 (driver < 450); uses nvmlProcessInfo_v1_t (16 bytes).
+    let mut infos_v1 = vec![NvmlProcessInfoV1::default(); CAP as usize];
+    for get_fn in [nvml.get_graphics_procs_v1, nvml.get_compute_procs_v1]
+        .into_iter()
+        .flatten()
+    {
+        let mut count = CAP;
+        let ret = unsafe { get_fn(device, &mut count, infos_v1.as_mut_ptr()) };
+        if ret != NVML_SUCCESS {
+            continue;
+        }
+        for info in &infos_v1[..count as usize] {
+            nvml_merge_proc(&mut result, info.pid, info.used_gpu_memory);
+        }
+    }
+    result
 }
 
 fn discover_gpu_cards(nvml: Option<&NvmlLib>) -> Vec<GpuCardMeta> {

@@ -125,7 +125,7 @@ Disk devices are structured as a tree, partitions are nested under their parent 
 
 **Memory** - used/total and swap from `/proc/meminfo`
 
-**GPU** - AMD only, via `/sys/class/drm` and hwmon. Busy percent, temperature, power draw, VRAM used/total. Per-process VRAM and graphics-engine usage via `drm-engine-gfx` fdinfo deltas.
+**GPU** - AMD, Nvidia (proprietary), and Intel Arc, via `/sys/class/drm` and vendor-specific APIs. Busy percent, temperature, power draw, VRAM used/total. Per-process VRAM and graphics-engine usage via fdinfo deltas. Nvidia reads card-level stats through NVML (`libnvidia-ml.so.1`) and requires the proprietary driver.
 
 **Network** - rx/tx bytes per second per interface from `/proc/net/dev` (loopback excluded)
 
