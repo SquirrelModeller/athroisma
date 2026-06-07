@@ -1,2 +1,6 @@
 .direnv
 target
+*.pkg.tar.zst
+pkg/
+src/
+athroisma-git/
