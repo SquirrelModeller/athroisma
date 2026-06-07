@@ -86,6 +86,8 @@ type FnNvmlGetHandleByPciBusId =
 type FnNvmlGetUtilizationRates =
     unsafe extern "C" fn(*mut libc::c_void, *mut NvmlUtilization) -> u32;
 type FnNvmlGetMemoryInfo = unsafe extern "C" fn(*mut libc::c_void, *mut NvmlMemory) -> u32;
+type FnNvmlGetTemperature = unsafe extern "C" fn(*mut libc::c_void, u32, *mut u32) -> u32;
+type FnNvmlGetPowerUsage = unsafe extern "C" fn(*mut libc::c_void, *mut u32) -> u32;
 
 #[repr(C)]
 struct NvmlUtilization {
@@ -105,6 +107,8 @@ struct NvmlLib {
     get_handle_by_pci: FnNvmlGetHandleByPciBusId,
     get_utilization: FnNvmlGetUtilizationRates,
     get_memory_info: FnNvmlGetMemoryInfo,
+    get_temperature: Option<FnNvmlGetTemperature>,
+    get_power_usage: Option<FnNvmlGetPowerUsage>,
 }
 
 // Static GPU metadata, discovered once at startup, cards (probably) don't change at runtime.
@@ -412,6 +416,8 @@ fn nvml_load() -> Option<NvmlLib> {
         let pci_ptr = libc::dlsym(handle, b"nvmlDeviceGetHandleByPciBusId_v2\0".as_ptr() as _);
         let util_ptr = libc::dlsym(handle, b"nvmlDeviceGetUtilizationRates\0".as_ptr() as _);
         let mem_ptr = libc::dlsym(handle, b"nvmlDeviceGetMemoryInfo\0".as_ptr() as _);
+        let temp_ptr = libc::dlsym(handle, b"nvmlDeviceGetTemperature\0".as_ptr() as _);
+        let power_ptr = libc::dlsym(handle, b"nvmlDeviceGetPowerUsage\0".as_ptr() as _);
 
         if init_ptr.is_null() || pci_ptr.is_null() || util_ptr.is_null() || mem_ptr.is_null() {
             libc::dlclose(handle);
@@ -429,6 +435,16 @@ fn nvml_load() -> Option<NvmlLib> {
             get_handle_by_pci: std::mem::transmute(pci_ptr),
             get_utilization: std::mem::transmute(util_ptr),
             get_memory_info: std::mem::transmute(mem_ptr),
+            get_temperature: if temp_ptr.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute(temp_ptr))
+            },
+            get_power_usage: if power_ptr.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute(power_ptr))
+            },
         })
     }
 }
@@ -468,15 +484,7 @@ fn discover_gpu_cards(nvml: Option<&NvmlLib>) -> Vec<GpuCardMeta> {
             .ok()
             .and_then(|mut d| d.next())
             .and_then(|e| e.ok())
-            .map(|e| e.path().to_string_lossy().into_owned())
-            .or_else(|| {
-                // Nvidia exposes hwmon under the PCI device, not the DRM card device
-                fs::read_dir(format!("/sys/bus/pci/devices/{pdev}/hwmon"))
-                    .ok()
-                    .and_then(|mut d| d.next())
-                    .and_then(|e| e.ok())
-                    .map(|e| e.path().to_string_lossy().into_owned())
-            });
+            .map(|e| e.path().to_string_lossy().into_owned());
         let nvml_device = if matches!(vendor, Vendor::Nvidia) {
             nvml.and_then(|n| nvml_device_for_pdev(n, &pdev))
         } else {
@@ -573,9 +581,9 @@ fn read_card_stats_amd(meta: &GpuCardMeta) -> (u8, i32, u32, u64, u64) {
 }
 
 fn read_card_stats_nvidia(meta: &GpuCardMeta, nvml: Option<&NvmlLib>) -> (u8, i32, u32, u64, u64) {
-    let (temp_mc, power_mw) = read_gpu_hwmon(meta);
+    let (hwmon_temp_mc, hwmon_power_mw) = read_gpu_hwmon(meta);
     let (Some(nvml), Some(device)) = (nvml, meta.nvml_device) else {
-        return (0, temp_mc, power_mw, 0, 0);
+        return (0, hwmon_temp_mc, hwmon_power_mw, 0, 0);
     };
     let mut util = NvmlUtilization { gpu: 0, memory: 0 };
     let mut mem = NvmlMemory {
@@ -583,6 +591,8 @@ fn read_card_stats_nvidia(meta: &GpuCardMeta, nvml: Option<&NvmlLib>) -> (u8, i3
         free: 0,
         used: 0,
     };
+    let mut temp_c: u32 = 0;
+    let mut power_mw_nvml: u32 = 0;
     unsafe {
         if (nvml.get_utilization)(device, &mut util) != NVML_SUCCESS {
             util.gpu = 0;
@@ -591,7 +601,27 @@ fn read_card_stats_nvidia(meta: &GpuCardMeta, nvml: Option<&NvmlLib>) -> (u8, i3
             mem.used = 0;
             mem.total = 0;
         }
+        if let Some(f) = nvml.get_temperature {
+            if f(device, 0, &mut temp_c) != NVML_SUCCESS {
+                temp_c = 0;
+            }
+        }
+        if let Some(f) = nvml.get_power_usage {
+            if f(device, &mut power_mw_nvml) != NVML_SUCCESS {
+                power_mw_nvml = 0;
+            }
+        }
     }
+    let temp_mc = if temp_c > 0 {
+        (temp_c * 1000) as i32
+    } else {
+        hwmon_temp_mc
+    };
+    let power_mw = if power_mw_nvml > 0 {
+        power_mw_nvml
+    } else {
+        hwmon_power_mw
+    };
     (util.gpu as u8, temp_mc, power_mw, mem.used, mem.total)
 }
 
@@ -766,8 +796,7 @@ fn walk_proc(cards: &[GpuCardMeta]) -> (Vec<ProcSample>, HashMap<String, Vec<Gpu
             continue;
         };
         for fd in fd_dir.flatten() {
-            let Some(fd_num): Option<u64> =
-                fd.file_name().to_str().and_then(|s| s.parse().ok())
+            let Some(fd_num): Option<u64> = fd.file_name().to_str().and_then(|s| s.parse().ok())
             else {
                 continue;
             };
