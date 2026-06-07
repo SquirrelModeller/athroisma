@@ -468,7 +468,15 @@ fn discover_gpu_cards(nvml: Option<&NvmlLib>) -> Vec<GpuCardMeta> {
             .ok()
             .and_then(|mut d| d.next())
             .and_then(|e| e.ok())
-            .map(|e| e.path().to_string_lossy().into_owned());
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .or_else(|| {
+                // Nvidia exposes hwmon under the PCI device, not the DRM card device
+                fs::read_dir(format!("/sys/bus/pci/devices/{pdev}/hwmon"))
+                    .ok()
+                    .and_then(|mut d| d.next())
+                    .and_then(|e| e.ok())
+                    .map(|e| e.path().to_string_lossy().into_owned())
+            });
         let nvml_device = if matches!(vendor, Vendor::Nvidia) {
             nvml.and_then(|n| nvml_device_for_pdev(n, &pdev))
         } else {
@@ -732,6 +740,7 @@ fn walk_proc(cards: &[GpuCardMeta]) -> (Vec<ProcSample>, HashMap<String, Vec<Gpu
         return (procs, Default::default());
     };
     let mut path = String::with_capacity(32);
+    let mut dri_fds: Vec<u64> = Vec::new();
     for entry in dir.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
@@ -749,27 +758,36 @@ fn walk_proc(cards: &[GpuCardMeta]) -> (Vec<ProcSample>, HashMap<String, Vec<Gpu
         if cards.is_empty() {
             continue;
         }
-        // Skip fdinfo entirely if the process has no open /dev/dri/ fds.
+        // Collect fd numbers for /dev/dri/ fds; skip fdinfo entirely if none.
         path.clear();
         write!(path, "/proc/{pid}/fd").unwrap();
-        let has_dri = fs::read_dir(&path).ok().is_some_and(|fds| {
-            fds.flatten().any(|fd| {
-                fs::read_link(fd.path())
-                    .ok()
-                    .and_then(|p| p.to_str().map(|s| s.starts_with("/dev/dri/")))
-                    .unwrap_or(false)
-            })
-        });
-        if !has_dri {
-            continue;
-        }
-        path.clear();
-        write!(path, "/proc/{pid}/fdinfo").unwrap();
-        let Ok(fds) = fs::read_dir(&path) else {
+        dri_fds.clear();
+        let Ok(fd_dir) = fs::read_dir(&path) else {
             continue;
         };
-        for fd in fds.flatten() {
-            let Ok(content) = fs::read_to_string(fd.path()) else {
+        for fd in fd_dir.flatten() {
+            let Some(fd_num): Option<u64> =
+                fd.file_name().to_str().and_then(|s| s.parse().ok())
+            else {
+                continue;
+            };
+            let Ok(target) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            if target
+                .to_str()
+                .map_or(false, |s| s.starts_with("/dev/dri/"))
+            {
+                dri_fds.push(fd_num);
+            }
+        }
+        if dri_fds.is_empty() {
+            continue;
+        }
+        for &fd_num in &dri_fds {
+            path.clear();
+            write!(path, "/proc/{pid}/fdinfo/{fd_num}").unwrap();
+            let Ok(content) = fs::read_to_string(&path) else {
                 continue;
             };
             let fd_pdev = content
