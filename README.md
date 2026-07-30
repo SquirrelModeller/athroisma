@@ -77,6 +77,19 @@ interval 2000
 
 The argv interval sets the initial value; stdin can override it at any point.
 
+## Getting an immediate report
+
+Normally a new sample is only taken once per interval, so a widget that just spawned (or reconnected) has to wait for the next tick before it sees any data. Send `now` on stdin to skip that wait. Athroisma samples and prints immediately instead of waiting out the rest of the current interval. The regular interval schedule then continues from that point, unaffected by the request.
+
+`now` can be combined with a request on the same line, which updates the filter and reports it right away:
+
+```
+now
+now cpu mem procs
+```
+
+Because the immediate sample is taken right after the previous one, rates (cpu%, net/disk throughput) computed over that very short window will be noisier than usual, but they settle back to normal on the next regular tick.
+
 ## Output shape
 
 ```json

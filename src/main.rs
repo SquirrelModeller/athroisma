@@ -1392,6 +1392,43 @@ fn run_bench(cards: &[GpuCardMeta], nvml: Option<&NvmlLib>, n: usize) {
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
 }
 
+fn wait_for_next_tick(
+    rx: &mpsc::Receiver<String>,
+    duration: Duration,
+    interval_ms: &mut u64,
+    req: &mut Request,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= duration {
+            return false;
+        }
+        match rx.recv_timeout(duration - elapsed) {
+            Ok(line) => {
+                if let Some(rest) = line.strip_prefix("interval") {
+                    if let Ok(ms) = rest.trim().parse::<u64>() {
+                        *interval_ms = ms;
+                    }
+                } else if let Some(rest) = line.strip_prefix("now") {
+                    let rest = rest.trim();
+                    if !rest.is_empty() {
+                        *req = Request::parse(rest);
+                    }
+                    return true;
+                } else {
+                    *req = Request::parse(&line);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                thread::sleep(duration.saturating_sub(start.elapsed()));
+                return false;
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1428,20 +1465,14 @@ fn main() {
         Request::parse(&initial_req)
     };
     let mut prev = sample(&cards, &req, nvml.as_ref());
-    thread::sleep(Duration::from_millis(interval_ms));
+    wait_for_next_tick(
+        &rx,
+        Duration::from_millis(interval_ms),
+        &mut interval_ms,
+        &mut req,
+    );
 
     loop {
-        // Drain channel, last line wins if multiple arrived during sleep.
-        while let Ok(line) = rx.try_recv() {
-            if let Some(rest) = line.strip_prefix("interval") {
-                if let Ok(ms) = rest.trim().parse::<u64>() {
-                    interval_ms = ms;
-                }
-            } else {
-                req = Request::parse(&line);
-            }
-        }
-
         let tick_start = Instant::now();
         let curr = sample(&cards, &req, nvml.as_ref());
         println!(
@@ -1450,9 +1481,7 @@ fn main() {
         );
         prev = curr;
         let target = Duration::from_millis(interval_ms);
-        let elapsed = tick_start.elapsed();
-        if elapsed < target {
-            thread::sleep(target - elapsed);
-        }
+        let remaining = target.saturating_sub(tick_start.elapsed());
+        wait_for_next_tick(&rx, remaining, &mut interval_ms, &mut req);
     }
 }
